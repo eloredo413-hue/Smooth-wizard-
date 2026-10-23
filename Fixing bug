@@ -1,4 +1,4 @@
--- [[ WIZARD SKIP v7 — single sound, no lingering frame, no gap ]]
+-- [[ WIZARD SKIP v8 — single sound, no lingering frame, no gap ]]
 
 task.spawn(function()
 	local TweenService = game:GetService("TweenService")
@@ -158,12 +158,13 @@ task.spawn(function()
 			local oldNamecall
 			local namecallWrapper = function(self, ...)
 				if muteClickUntil > 0 and os.clock() < muteClickUntil then
-					-- No namecalls before oldNamecall below, or the pending method
-					-- name changes; ClassName is a plain property read.
-					local method = getnamecallmethod()
-					if (method == "Play" and typeof(self) == "Instance" and self.ClassName == "Sound")
-					   or (method == "PlayLocalSound" and self == SoundService) then
-						muteClickUntil = 0
+					-- No Instance namecalls before oldNamecall below, or the pending
+					-- method name changes; ClassName is a plain property read.
+					-- Lowercase too: older games use the deprecated sound:play().
+					local method = tostring(getnamecallmethod()):lower()
+					if ((method == "play" or method == "resume")
+					    and typeof(self) == "Instance" and self.ClassName == "Sound")
+					   or (method == "playlocalsound" and self == SoundService) then
 						return
 					end
 				end
@@ -178,6 +179,58 @@ task.spawn(function()
 			oldNamecall = hookmetamethod(game, "__namecall", namecallWrapper)
 		end)
 		log("__namecall" .. (ok and " hooked" or (" hook FAILED: " .. tostring(err))))
+	end
+
+	-- The hook above only catches sound:Play() calls. To catch the click
+	-- however the game plays it, any sound that starts within 0.3s of the
+	-- hidden press is stopped. Sounds already playing (music) are left alone.
+	local function soundsIn(roots)
+		local list = {}
+		for _, root in ipairs(roots) do
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("Sound") then table.insert(list, d) end
+			end
+		end
+		return list
+	end
+
+	local function silenceNextPress()
+		local roots = { player, SoundService }
+		if workspace.CurrentCamera then table.insert(roots, workspace.CurrentCamera) end
+
+		local before = {}
+		for _, s in ipairs(soundsIn(roots)) do
+			if s.IsPlaying then before[s] = s.TimePosition end
+		end
+
+		local function stopIfNew(s)
+			if not s.IsPlaying then return end
+			local t = before[s]
+			-- Not playing before, or restarted from the beginning.
+			if t == nil or s.TimePosition < t then s:Stop() end
+		end
+
+		local function sweep()
+			for _, s in ipairs(soundsIn(roots)) do pcall(stopIfNew, s) end
+		end
+
+		local stopAt = os.clock() + 0.3
+		muteClickUntil = stopAt
+
+		-- Sounds created on the spot can be parented anywhere.
+		local added = game.DescendantAdded:Connect(function(d)
+			if d:IsA("Sound") then task.defer(pcall, stopIfNew, d) end
+		end)
+		local stepped
+		stepped = RunService.RenderStepped:Connect(function()
+			sweep()
+			if os.clock() >= stopAt then
+				stepped:Disconnect()
+				added:Disconnect()
+			end
+		end)
+
+		return sweep
 	end
 
 	local watchedBody = setmetatable({}, {__mode = "k"})
@@ -225,8 +278,10 @@ task.spawn(function()
 
 		-- Let the game's own No handler run, so it records the answer and
 		-- shows the forcefield prompt itself.
-		muteClickUntil = os.clock() + 0.3
+		local sweep = silenceNextPress()
 		fireClick(noBtn)
+		-- Stop it before it's heard if the handler played it straight away.
+		sweep()
 	end
 
 	local function check(frame)
@@ -259,5 +314,5 @@ task.spawn(function()
 		end
 	end)
 
-	log("v7 watching")
+	log("v8 watching")
 end)
