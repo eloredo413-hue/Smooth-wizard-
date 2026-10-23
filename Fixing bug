@@ -1,4 +1,4 @@
--- [[ WIZARD SKIP — single sound, no lingering frame, no gap ]]
+-- [[ WIZARD SKIP v5 — single sound, no lingering frame, no gap ]]
 
 task.spawn(function()
 	local TweenService = game:GetService("TweenService")
@@ -397,5 +397,5 @@ task.spawn(function()
 		end
 	end)
 
-	log("watching")
+	log("v5 watching")
 end)
