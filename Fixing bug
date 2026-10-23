@@ -28,9 +28,8 @@ task.spawn(function()
 	clickSfx.Parent = SoundService
 	local function playClick() clickSfx:Stop() clickSfx:Play() end
 
-	-- On-screen timeline so the cause of the gap shows up in a screen
-	-- recording (the console is awkward on mobile). Set to false when done.
-	local SHOW_LOG = true
+	-- On-screen timeline for debugging; prints still go to the console.
+	local SHOW_LOG = false
 	local t0 = os.clock()
 	local logLabel
 	if SHOW_LOG then
@@ -97,6 +96,45 @@ task.spawn(function()
 		end
 		return nil
 	end
+
+	-- Find the wizard's own functions by their Luau names. debug.info works on
+	-- any function, so this doesn't depend on the executor exposing upvalue
+	-- names (most don't, which is why the old lookup never matched).
+	local WANTED = { showForcefieldUI = true, OnMaterialsSelected = true }
+	local gameFns = {}
+
+	local function collectNamed(list)
+		for _, f in pairs(list) do
+			if type(f) == "function" then
+				local ok, name = pcall(debug.info, f, "n")
+				if ok and WANTED[name] and not gameFns[name] then
+					gameFns[name] = f
+				end
+			end
+		end
+	end
+
+	local function findGameFns(handler)
+		if handler then
+			gameFns.showForcefieldUI = gameFns.showForcefieldUI or getUpvalue(handler, "showForcefieldUI")
+			gameFns.OnMaterialsSelected = gameFns.OnMaterialsSelected or getUpvalue(handler, "OnMaterialsSelected")
+			if debug.getupvalues then
+				local ok, ups = pcall(debug.getupvalues, handler)
+				if ok and type(ups) == "table" then collectNamed(ups) end
+			end
+		end
+		if not gameFns.showForcefieldUI and getgc then
+			local ok, gc = pcall(getgc, false)
+			if ok and type(gc) == "table" then collectNamed(gc) end
+		end
+		return gameFns.showForcefieldUI, gameFns.OnMaterialsSelected
+	end
+
+	-- Scan ahead of time so skipping the prompt doesn't hitch.
+	task.defer(function()
+		local showFF = findGameFns(nil)
+		log("pre-scan: showForcefieldUI " .. (showFF and "found" or "not found yet"))
+	end)
 
 	local function getClickHandler(btn)
 		if not btn or not getconnections then return nil end
@@ -227,14 +265,15 @@ task.spawn(function()
 		end
 
 		local handler = getClickHandler(noBtn)
-		local showFF = handler and getUpvalue(handler, "showForcefieldUI")
-		local onMats = handler and getUpvalue(handler, "OnMaterialsSelected")
+		local showFF, onMats = findGameFns(handler)
 
-		if type(showFF) == "function" and type(onMats) == "function" then
-			log("fast path")
+		if type(showFF) == "function" then
+			-- Show the forcefield prompt straight away instead of letting the
+			-- game wait out the hidden prompt's slide-out first.
+			log("fast path" .. (onMats and "" or " (OnMaterialsSelected not found)"))
 			startRush()
 			task.spawn(showFF)
-			task.spawn(pcall, onMats, false)
+			if type(onMats) == "function" then task.spawn(pcall, onMats, false) end
 			playClick()
 			pcall(function() frame:Destroy() end)
 		else
