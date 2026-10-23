@@ -80,14 +80,14 @@ task.spawn(function()
 		local oldCreate = TweenService.Create
 		pcall(function()
 			local wrapper = function(self, obj, tweenInfo, goal)
-				if isMaterialsFrame(obj) and tweenInfo and tweenInfo.Time > 0 then
+				if isMaterialsFrame(obj) and tweenInfo and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0) then
 					local newInfo = TweenInfo.new(
 						0,
 						tweenInfo.EasingStyle,
 						tweenInfo.EasingDirection,
 						tweenInfo.RepeatCount,
 						tweenInfo.Reverses,
-						tweenInfo.DelayTime
+						0
 					)
 					return oldCreate(self, obj, newInfo, goal)
 				end
@@ -101,50 +101,68 @@ task.spawn(function()
 
 	local handled = setmetatable({}, {__mode = "k"})
 
+	local function skipFrame(frame)
+		if handled[frame] or not frame:IsA("Frame") or not isMaterialsFrame(frame) then return end
+		handled[frame] = true
+
+		pcall(function()
+			frame.Visible = false
+			frame.Position = UDim2.new(0, 0, 0, -9999)
+		end)
+
+		local noBtn
+		for _, d in ipairs(frame:GetDescendants()) do
+			if d:IsA("TextButton") and d.Text == "No" then
+				noBtn = d
+				break
+			end
+		end
+
+		if not noBtn then
+			print("[Wizard Skip] No button not found.")
+			return
+		end
+
+		local handler = getClickHandler(noBtn)
+		local showFF = handler and getUpvalue(handler, "showForcefieldUI")
+		local onMats = handler and getUpvalue(handler, "OnMaterialsSelected")
+
+		if type(showFF) == "function" and type(onMats) == "function" then
+			print("[Wizard Skip] Fast path — no gap, single sound.")
+			-- Start the forcefield slide-in first. OnMaterialsSelected can yield
+			-- (e.g. a remote call), and running it inline held showFF back.
+			task.spawn(showFF)
+			task.spawn(pcall, onMats, false)
+			playClick()
+			pcall(function() frame:Destroy() end)
+		else
+			print("[Wizard Skip] Fallback — firing No.")
+			fireClick(noBtn)
+		end
+	end
+
+	-- React the moment the frame (or its question text) shows up instead of
+	-- waiting for the next render step.
+	sg.ChildAdded:Connect(function(child)
+		skipFrame(child)
+		if handled[child] or not child:IsA("Frame") then return end
+		local conn
+		conn = child.DescendantAdded:Connect(function(d)
+			if d:IsA("TextLabel") then
+				task.defer(skipFrame, child)
+				d:GetPropertyChangedSignal("Text"):Connect(function()
+					skipFrame(child)
+				end)
+			end
+			if handled[child] then conn:Disconnect() end
+		end)
+	end)
+
 	RunService.RenderStepped:Connect(function()
 		if not sg or not sg.Parent then return end
 
 		for _, frame in ipairs(sg:GetChildren()) do
-			if frame:IsA("Frame") and not handled[frame] and isMaterialsFrame(frame) then
-				handled[frame] = true
-
-				pcall(function()
-					frame.Visible = false
-					frame.Position = UDim2.new(0, 0, 0, -9999)
-				end)
-
-				local noBtn
-				for _, d in ipairs(frame:GetDescendants()) do
-					if d:IsA("TextButton") and d.Text == "No" then
-						noBtn = d
-						break
-					end
-				end
-
-				if not noBtn then
-					print("[Wizard Skip] No button not found.")
-					return
-				end
-
-				local handler = getClickHandler(noBtn)
-				local showFF = handler and getUpvalue(handler, "showForcefieldUI")
-				local onMats = handler and getUpvalue(handler, "OnMaterialsSelected")
-
-				if type(showFF) == "function" and type(onMats) == "function" then
-					print("[Wizard Skip] Fast path — no gap, single sound.")
-					pcall(onMats, false)
-					playClick()
-					pcall(function() frame:Destroy() end)
-					task.spawn(showFF)
-				else
-					print("[Wizard Skip] Fallback — firing No.")
-					task.defer(function()
-						fireClick(noBtn)
-					end)
-				end
-
-				return
-			end
+			skipFrame(frame)
 		end
 	end)
 
