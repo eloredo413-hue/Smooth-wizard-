@@ -51,7 +51,8 @@ task.spawn(function()
 		local i = 1
 		while true do
 			local ok, name, value = pcall(debug.getupvalue, fn, i)
-			if not ok or name == nil then break end
+			-- Most executors return only the value, so names can't be matched.
+			if not ok or type(name) ~= "string" then break end
 			if name == targetName then return value end
 			i = i + 1
 		end
@@ -68,6 +69,15 @@ task.spawn(function()
 		return nil
 	end
 
+	local function getScriptOf(fn)
+		if type(fn) ~= "function" or not getfenv then return nil end
+		local ok, env = pcall(getfenv, fn)
+		if ok and type(env) == "table" and typeof(env.script) == "Instance" then
+			return env.script
+		end
+		return nil
+	end
+
 	local function fireClick(btn)
 		if not btn or not btn.Parent then return end
 		if firesignal then
@@ -76,27 +86,84 @@ task.spawn(function()
 		pcall(function() btn.MouseButton1Click:Fire() end)
 	end
 
+	-- While "rushing", the wizard's own waits are cut to a single frame and its
+	-- tween delays to 0. The game waits out the (now invisible) materials
+	-- prompt's slide-out before showing the forcefield prompt, and that wait
+	-- is the empty gap.
+	local rush = { active = false, script = nil, startedAt = 0, endAt = nil }
+
+	local function rushing()
+		if not rush.active then return false end
+		if not rush.script or not getcallingscript then return true end
+		local ok, caller = pcall(getcallingscript)
+		return ok and caller == rush.script
+	end
+
+	local function startRush(fn)
+		rush.script = getScriptOf(fn)
+		rush.startedAt = os.clock()
+		rush.endAt = nil
+		rush.active = true
+	end
+
 	if hookfunction then
-		local oldCreate = TweenService.Create
-		pcall(function()
-			local wrapper = function(self, obj, tweenInfo, goal)
-				if isMaterialsFrame(obj) and tweenInfo and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0) then
-					local newInfo = TweenInfo.new(
-						0,
-						tweenInfo.EasingStyle,
-						tweenInfo.EasingDirection,
-						tweenInfo.RepeatCount,
-						tweenInfo.Reverses,
-						0
-					)
-					return oldCreate(self, obj, newInfo, goal)
+		local ok, err = pcall(function()
+			-- hookfunction returns the original; calling the hooked function
+			-- from inside the wrapper would recurse into the wrapper.
+			local oldCreate
+			local createWrapper = function(self, obj, tweenInfo, goal)
+				if typeof(tweenInfo) == "TweenInfo" then
+					local materials = isMaterialsFrame(obj)
+					if (materials and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0))
+					   or (rushing() and tweenInfo.DelayTime > 0) then
+						tweenInfo = TweenInfo.new(
+							materials and 0 or tweenInfo.Time,
+							tweenInfo.EasingStyle,
+							tweenInfo.EasingDirection,
+							tweenInfo.RepeatCount,
+							tweenInfo.Reverses,
+							0
+						)
+					end
 				end
 				return oldCreate(self, obj, tweenInfo, goal)
 			end
-			if newcclosure then wrapper = newcclosure(wrapper) end
-			hookfunction(oldCreate, wrapper)
-			print("[Wizard Skip] TweenService hooked.")
+			if newcclosure then createWrapper = newcclosure(createWrapper) end
+			oldCreate = hookfunction(TweenService.Create, createWrapper)
+
+			-- A rushed wait still yields one frame so loops can't spin forever.
+			local oldTaskWait
+			local taskWaitWrapper = function(t)
+				if rushing() then return oldTaskWait() end
+				return oldTaskWait(t)
+			end
+			if newcclosure then taskWaitWrapper = newcclosure(taskWaitWrapper) end
+			oldTaskWait = hookfunction(task.wait, taskWaitWrapper)
+
+			local oldTaskDelay
+			local taskDelayWrapper = function(t, ...)
+				if rushing() then return oldTaskDelay(0, ...) end
+				return oldTaskDelay(t, ...)
+			end
+			if newcclosure then taskDelayWrapper = newcclosure(taskDelayWrapper) end
+			oldTaskDelay = hookfunction(task.delay, taskDelayWrapper)
+
+			local legacyWait = (getrenv and getrenv().wait) or wait
+			local oldWait
+			local waitWrapper = function(t)
+				if rushing() then return oldWait() end
+				return oldWait(t)
+			end
+			if newcclosure then waitWrapper = newcclosure(waitWrapper) end
+			oldWait = hookfunction(legacyWait, waitWrapper)
 		end)
+		if ok then
+			print("[Wizard Skip] Hooks installed.")
+		else
+			warn("[Wizard Skip] Hooking failed: " .. tostring(err))
+		end
+	else
+		warn("[Wizard Skip] hookfunction unavailable — gap can't be removed.")
 	end
 
 	local handled = setmetatable({}, {__mode = "k"})
@@ -128,15 +195,15 @@ task.spawn(function()
 		local onMats = handler and getUpvalue(handler, "OnMaterialsSelected")
 
 		if type(showFF) == "function" and type(onMats) == "function" then
-			print("[Wizard Skip] Fast path — no gap, single sound.")
-			-- Start the forcefield slide-in first. OnMaterialsSelected can yield
-			-- (e.g. a remote call), and running it inline held showFF back.
+			print("[Wizard Skip] Fast path.")
+			startRush(showFF)
 			task.spawn(showFF)
 			task.spawn(pcall, onMats, false)
 			playClick()
 			pcall(function() frame:Destroy() end)
 		else
 			print("[Wizard Skip] Fallback — firing No.")
+			startRush(handler)
 			fireClick(noBtn)
 		end
 	end
@@ -145,7 +212,13 @@ task.spawn(function()
 	-- waiting for the next render step.
 	sg.ChildAdded:Connect(function(child)
 		skipFrame(child)
-		if handled[child] or not child:IsA("Frame") then return end
+		if not child:IsA("Frame") then return end
+		if rush.active and not handled[child] and not rush.endAt then
+			-- The next prompt arrived; let its slide-in tween get created, then stop.
+			rush.endAt = os.clock() + 0.15
+			print(string.format("[Wizard Skip] Next prompt after %.2fs.", os.clock() - rush.startedAt))
+		end
+		if handled[child] then return end
 		local conn
 		conn = child.DescendantAdded:Connect(function(d)
 			if d:IsA("TextLabel") then
@@ -159,6 +232,13 @@ task.spawn(function()
 	end)
 
 	RunService.RenderStepped:Connect(function()
+		if rush.active then
+			local now = os.clock()
+			if (rush.endAt and now >= rush.endAt) or now - rush.startedAt > 2 then
+				rush.active = false
+			end
+		end
+
 		if not sg or not sg.Parent then return end
 
 		for _, frame in ipairs(sg:GetChildren()) do
