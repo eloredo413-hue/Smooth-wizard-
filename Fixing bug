@@ -1,0 +1,152 @@
+-- [[ WIZARD SKIP — single sound, no lingering frame, no gap ]]
+
+task.spawn(function()
+	local TweenService = game:GetService("TweenService")
+	local Players = game:GetService("Players")
+	local SoundService = game:GetService("SoundService")
+	local RunService = game:GetService("RunService")
+
+	local player = Players.LocalPlayer
+	local pg = player:WaitForChild("PlayerGui", 30)
+
+	local sg
+	local elapsed = 0
+	while elapsed < 60 do
+		sg = pg:FindFirstChild("BloxyParadoxProject")
+		if sg then break end
+		task.wait(0.2)
+		elapsed = elapsed + 0.2
+	end
+	if not sg then
+		warn("[Wizard Skip] GUI never appeared.")
+		return
+	end
+
+	local clickSfx = Instance.new("Sound")
+	clickSfx.SoundId = "rbxassetid://12221967"
+	clickSfx.Volume = 0.6
+	clickSfx.Parent = SoundService
+	local function playClick() clickSfx:Stop() clickSfx:Play() end
+
+	local function isMaterialsFrame(obj)
+		if not obj or typeof(obj) ~= "Instance" then return false end
+		if not obj:IsA("GuiObject") then return false end
+		local found = false
+		pcall(function()
+			for _, d in ipairs(obj:GetDescendants()) do
+				if d:IsA("TextLabel")
+				   and type(d.Text) == "string"
+				   and d.Text:lower():find("old materials", 1, true) then
+					found = true
+					return
+				end
+			end
+		end)
+		return found
+	end
+
+	local function getUpvalue(fn, targetName)
+		if type(fn) ~= "function" then return nil end
+		if not debug or not debug.getupvalue then return nil end
+		local i = 1
+		while true do
+			local ok, name, value = pcall(debug.getupvalue, fn, i)
+			if not ok or name == nil then break end
+			if name == targetName then return value end
+			i = i + 1
+		end
+		return nil
+	end
+
+	local function getClickHandler(btn)
+		if not btn or not getconnections then return nil end
+		local ok, conns = pcall(getconnections, btn.MouseButton1Click)
+		if not ok or type(conns) ~= "table" then return nil end
+		for _, conn in ipairs(conns) do
+			if conn.Function then return conn.Function end
+		end
+		return nil
+	end
+
+	local function fireClick(btn)
+		if not btn or not btn.Parent then return end
+		if firesignal then
+			if pcall(firesignal, btn.MouseButton1Click) then return end
+		end
+		pcall(function() btn.MouseButton1Click:Fire() end)
+	end
+
+	if hookfunction then
+		local oldCreate = TweenService.Create
+		pcall(function()
+			local wrapper = function(self, obj, tweenInfo, goal)
+				if isMaterialsFrame(obj) and tweenInfo and tweenInfo.Time > 0 then
+					local newInfo = TweenInfo.new(
+						0,
+						tweenInfo.EasingStyle,
+						tweenInfo.EasingDirection,
+						tweenInfo.RepeatCount,
+						tweenInfo.Reverses,
+						tweenInfo.DelayTime
+					)
+					return oldCreate(self, obj, newInfo, goal)
+				end
+				return oldCreate(self, obj, tweenInfo, goal)
+			end
+			if newcclosure then wrapper = newcclosure(wrapper) end
+			hookfunction(oldCreate, wrapper)
+			print("[Wizard Skip] TweenService hooked.")
+		end)
+	end
+
+	local handled = setmetatable({}, {__mode = "k"})
+
+	RunService.RenderStepped:Connect(function()
+		if not sg or not sg.Parent then return end
+
+		for _, frame in ipairs(sg:GetChildren()) do
+			if frame:IsA("Frame") and not handled[frame] and isMaterialsFrame(frame) then
+				handled[frame] = true
+
+				pcall(function()
+					frame.Visible = false
+					frame.Position = UDim2.new(0, 0, 0, -9999)
+				end)
+
+				local noBtn
+				for _, d in ipairs(frame:GetDescendants()) do
+					if d:IsA("TextButton") and d.Text == "No" then
+						noBtn = d
+						break
+					end
+				end
+
+				if not noBtn then
+					print("[Wizard Skip] No button not found.")
+					return
+				end
+
+				local handler = getClickHandler(noBtn)
+				local showFF = handler and getUpvalue(handler, "showForcefieldUI")
+				local onMats = handler and getUpvalue(handler, "OnMaterialsSelected")
+
+				if type(showFF) == "function" and type(onMats) == "function" then
+					print("[Wizard Skip] Fast path — no gap, single sound.")
+					pcall(onMats, false)
+					playClick()
+					pcall(function() frame:Destroy() end)
+					task.spawn(showFF)
+				else
+					print("[Wizard Skip] Fallback — firing No.")
+					task.defer(function()
+						fireClick(noBtn)
+					end)
+				end
+
+				return
+			end
+		end
+	end)
+
+	print("[Wizard Skip] Watching.")
+end)
