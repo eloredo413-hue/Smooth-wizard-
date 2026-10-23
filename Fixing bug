@@ -1,9 +1,10 @@
--- [[ WIZARD SKIP v6 — single sound, no lingering frame, no gap ]]
+-- [[ WIZARD SKIP v7 — single sound, no lingering frame, no gap ]]
 
 task.spawn(function()
 	local TweenService = game:GetService("TweenService")
 	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
+	local SoundService = game:GetService("SoundService")
 
 	local player = Players.LocalPlayer
 	local pg = player:WaitForChild("PlayerGui", 30)
@@ -146,12 +147,26 @@ task.spawn(function()
 		log("TweenService.Create" .. (ok and " hooked" or (" hook FAILED: " .. tostring(err))))
 	end
 
+	-- Set when the hidden No is pressed so the game's click sound for it is
+	-- swallowed; the player already heard one for the body prompt.
+	local muteClickUntil = 0
+
 	-- The game calls TweenService:Create(...), which goes through __namecall
 	-- and skips the hookfunction hook above on many executors.
 	if hookmetamethod and getnamecallmethod then
 		local ok, err = pcall(function()
 			local oldNamecall
 			local namecallWrapper = function(self, ...)
+				if muteClickUntil > 0 and os.clock() < muteClickUntil then
+					-- No namecalls before oldNamecall below, or the pending method
+					-- name changes; ClassName is a plain property read.
+					local method = getnamecallmethod()
+					if (method == "Play" and typeof(self) == "Instance" and self.ClassName == "Sound")
+					   or (method == "PlayLocalSound" and self == SoundService) then
+						muteClickUntil = 0
+						return
+					end
+				end
 				if self == TweenService and getnamecallmethod() == "Create" then
 					-- Index call, not a namecall: anything namecalled while checking
 					-- changes the pending method name, so oldNamecall can't be reused.
@@ -210,6 +225,7 @@ task.spawn(function()
 
 		-- Let the game's own No handler run, so it records the answer and
 		-- shows the forcefield prompt itself.
+		muteClickUntil = os.clock() + 0.3
 		fireClick(noBtn)
 	end
 
@@ -243,5 +259,5 @@ task.spawn(function()
 		end
 	end)
 
-	log("v6 watching")
+	log("v7 watching")
 end)
