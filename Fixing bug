@@ -167,6 +167,47 @@ task.spawn(function()
 		rush.active = true
 	end
 
+	local handled = setmetatable({}, {__mode = "k"})
+	local tweenTargets = setmetatable({}, {__mode = "k"})
+
+	local function inHandledFrame(obj)
+		for frame in pairs(handled) do
+			if obj == frame or obj:IsDescendantOf(frame) then return true end
+		end
+		return false
+	end
+
+	-- Tweens on the hidden prompt finish instantly, and tween delays are
+	-- dropped while rushing.
+	local function adjustTweenInfo(obj, tweenInfo)
+		if typeof(obj) ~= "Instance" or typeof(tweenInfo) ~= "TweenInfo" then return tweenInfo end
+		local materials = obj:IsA("GuiObject") and (inHandledFrame(obj) or isMaterialsFrame(obj))
+		if (materials and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0))
+		   or (rush.active and tweenInfo.DelayTime > 0) then
+			if rush.active then
+				rush.skipped = rush.skipped + (materials and tweenInfo.Time or 0) + tweenInfo.DelayTime
+			end
+			return TweenInfo.new(
+				materials and 0 or tweenInfo.Time,
+				tweenInfo.EasingStyle,
+				tweenInfo.EasingDirection,
+				tweenInfo.RepeatCount,
+				tweenInfo.Reverses,
+				0
+			)
+		end
+		return tweenInfo
+	end
+
+	local function createTween(create, self, obj, tweenInfo, goal)
+		local ok, newInfo = pcall(adjustTweenInfo, obj, tweenInfo)
+		local tween = create(self, obj, ok and newInfo or tweenInfo, goal)
+		if typeof(obj) == "Instance" and typeof(tween) == "Instance" then
+			tweenTargets[tween] = obj
+		end
+		return tween
+	end
+
 	-- Each hook is installed on its own so one failure doesn't take the rest
 	-- down with it. hookfunction returns the original; calling the hooked
 	-- function from inside its wrapper would recurse into the wrapper.
@@ -183,24 +224,7 @@ task.spawn(function()
 	if hookfunction then
 		hook("TweenService.Create", TweenService.Create, function(orig)
 			return function(self, obj, tweenInfo, goal)
-				if typeof(tweenInfo) == "TweenInfo" then
-					local materials = isMaterialsFrame(obj)
-					if (materials and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0))
-					   or (rush.active and tweenInfo.DelayTime > 0) then
-						if rush.active then
-							rush.skipped = rush.skipped + (materials and tweenInfo.Time or 0) + tweenInfo.DelayTime
-						end
-						tweenInfo = TweenInfo.new(
-							materials and 0 or tweenInfo.Time,
-							tweenInfo.EasingStyle,
-							tweenInfo.EasingDirection,
-							tweenInfo.RepeatCount,
-							tweenInfo.Reverses,
-							0
-						)
-					end
-				end
-				return orig(self, obj, tweenInfo, goal)
+				return createTween(orig, self, obj, tweenInfo, goal)
 			end
 		end)
 
@@ -230,6 +254,45 @@ task.spawn(function()
 		log("hookfunction unavailable")
 	end
 
+	-- The game calls TweenService:Create(...), which goes through __namecall
+	-- and skips the hookfunction hook above on many executors. That's why the
+	-- hidden prompt kept its full slide-in and the forcefield prompt waited
+	-- for it.
+	if hookmetamethod and getnamecallmethod then
+		local ok, err = pcall(function()
+			local oldNamecall
+			local namecallWrapper = function(self, ...)
+				if self == TweenService and getnamecallmethod() == "Create" then
+					-- Index call, not a namecall: anything namecalled while adjusting
+					-- changes the pending method name, so oldNamecall can't be reused.
+					return createTween(TweenService.Create, self, ...)
+				end
+				return oldNamecall(self, ...)
+			end
+			if newcclosure then namecallWrapper = newcclosure(namecallWrapper) end
+			oldNamecall = hookmetamethod(game, "__namecall", namecallWrapper)
+		end)
+		log("__namecall" .. (ok and " hooked" or (" hook FAILED: " .. tostring(err))))
+	else
+		log("hookmetamethod unavailable")
+	end
+
+	-- Tweens started on the prompt before it was recognised: cancel them so
+	-- anything waiting on Completed carries on now, and stop any that get
+	-- played later.
+	local function finishTweens(frame)
+		for tween, target in pairs(tweenTargets) do
+			if target == frame or target:IsDescendantOf(frame) then
+				pcall(function() tween:Cancel() end)
+				tween:GetPropertyChangedSignal("PlaybackState"):Connect(function()
+					if tween.PlaybackState == Enum.PlaybackState.Playing then
+						tween:Cancel()
+					end
+				end)
+			end
+		end
+	end
+
 	local function questionOf(frame)
 		for _, d in ipairs(frame:GetDescendants()) do
 			if d:IsA("TextLabel") and d.Text ~= "" then
@@ -239,8 +302,6 @@ task.spawn(function()
 		return "?"
 	end
 
-	local handled = setmetatable({}, {__mode = "k"})
-
 	local function skipFrame(frame)
 		if handled[frame] or not frame:IsA("Frame") or not isMaterialsFrame(frame) then return end
 		handled[frame] = true
@@ -248,8 +309,12 @@ task.spawn(function()
 
 		pcall(function()
 			frame.Visible = false
-			frame.Position = UDim2.new(0, 0, 0, -9999)
+			-- Overriding with a 0s legacy tween also ends any TweenPosition the
+			-- game started on it.
+			frame:TweenPosition(UDim2.new(0, 0, 0, -9999), Enum.EasingDirection.Out,
+				Enum.EasingStyle.Linear, 0, true)
 		end)
+		finishTweens(frame)
 
 		local noBtn
 		for _, d in ipairs(frame:GetDescendants()) do
