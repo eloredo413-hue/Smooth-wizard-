@@ -1,9 +1,8 @@
--- [[ WIZARD SKIP v5 — single sound, no lingering frame, no gap ]]
+-- [[ WIZARD SKIP v6 — single sound, no lingering frame, no gap ]]
 
 task.spawn(function()
 	local TweenService = game:GetService("TweenService")
 	local Players = game:GetService("Players")
-	local SoundService = game:GetService("SoundService")
 	local RunService = game:GetService("RunService")
 
 	local player = Players.LocalPlayer
@@ -21,12 +20,6 @@ task.spawn(function()
 		warn("[Wizard Skip] GUI never appeared.")
 		return
 	end
-
-	local clickSfx = Instance.new("Sound")
-	clickSfx.SoundId = "rbxassetid://12221967"
-	clickSfx.Volume = 0.6
-	clickSfx.Parent = SoundService
-	local function playClick() clickSfx:Stop() clickSfx:Play() end
 
 	-- On-screen timeline for debugging; prints still go to the console.
 	local SHOW_LOG = false
@@ -66,7 +59,7 @@ task.spawn(function()
 		end
 	end
 
-	local function isMaterialsFrame(obj)
+	local function hasText(obj, needle)
 		if not obj or typeof(obj) ~= "Instance" then return false end
 		if not obj:IsA("GuiObject") then return false end
 		local found = false
@@ -74,7 +67,7 @@ task.spawn(function()
 			for _, d in ipairs(obj:GetDescendants()) do
 				if d:IsA("TextLabel")
 				   and type(d.Text) == "string"
-				   and d.Text:lower():find("old materials", 1, true) then
+				   and d.Text:lower():find(needle, 1, true) then
 					found = true
 					return
 				end
@@ -83,68 +76,9 @@ task.spawn(function()
 		return found
 	end
 
-	local function getUpvalue(fn, targetName)
-		if type(fn) ~= "function" then return nil end
-		if not debug or not debug.getupvalue then return nil end
-		local i = 1
-		while true do
-			local ok, name, value = pcall(debug.getupvalue, fn, i)
-			-- Most executors return only the value, so names can't be matched.
-			if not ok or type(name) ~= "string" then break end
-			if name == targetName then return value end
-			i = i + 1
-		end
-		return nil
-	end
-
-	-- Find the wizard's own functions by their Luau names. debug.info works on
-	-- any function, so this doesn't depend on the executor exposing upvalue
-	-- names (most don't, which is why the old lookup never matched).
-	local WANTED = { showForcefieldUI = true, OnMaterialsSelected = true }
-	local gameFns = {}
-
-	local function collectNamed(list)
-		for _, f in pairs(list) do
-			if type(f) == "function" then
-				local ok, name = pcall(debug.info, f, "n")
-				if ok and WANTED[name] and not gameFns[name] then
-					gameFns[name] = f
-				end
-			end
-		end
-	end
-
-	local function findGameFns(handler)
-		if handler then
-			gameFns.showForcefieldUI = gameFns.showForcefieldUI or getUpvalue(handler, "showForcefieldUI")
-			gameFns.OnMaterialsSelected = gameFns.OnMaterialsSelected or getUpvalue(handler, "OnMaterialsSelected")
-			if debug.getupvalues then
-				local ok, ups = pcall(debug.getupvalues, handler)
-				if ok and type(ups) == "table" then collectNamed(ups) end
-			end
-		end
-		if not gameFns.showForcefieldUI and getgc then
-			local ok, gc = pcall(getgc, false)
-			if ok and type(gc) == "table" then collectNamed(gc) end
-		end
-		return gameFns.showForcefieldUI, gameFns.OnMaterialsSelected
-	end
-
-	-- Scan ahead of time so skipping the prompt doesn't hitch.
-	task.defer(function()
-		local showFF = findGameFns(nil)
-		log("pre-scan: showForcefieldUI " .. (showFF and "found" or "not found yet"))
-	end)
-
-	local function getClickHandler(btn)
-		if not btn or not getconnections then return nil end
-		local ok, conns = pcall(getconnections, btn.MouseButton1Click)
-		if not ok or type(conns) ~= "table" then return nil end
-		for _, conn in ipairs(conns) do
-			if conn.Function then return conn.Function end
-		end
-		return nil
-	end
+	local function isMaterialsFrame(obj) return hasText(obj, "old materials") end
+	-- The prompt shown right before the materials one.
+	local function isBodyFrame(obj) return hasText(obj, "2006 body") end
 
 	local function fireClick(btn)
 		if not btn or not btn.Parent then return end
@@ -154,116 +88,72 @@ task.spawn(function()
 		pcall(function() btn.MouseButton1Click:Fire() end)
 	end
 
-	-- While "rushing", waits are cut to a single frame and tween delays to 0.
-	-- The game waits out the (now invisible) materials prompt before showing
-	-- the forcefield prompt, and that wait is the empty gap. The window only
-	-- lasts until the next prompt appears (2s at most).
-	local rush = { active = false, startedAt = 0, endAt = nil, skipped = 0 }
-
-	local function startRush()
-		rush.startedAt = os.clock()
-		rush.endAt = nil
-		rush.skipped = 0
-		rush.active = true
-	end
-
+	-- The gap is the hidden materials prompt playing its full slide-in: the
+	-- game only moves on to the forcefield prompt once it has finished. So
+	-- every tween on that prompt is made to take 0s. It still finishes as
+	-- "Completed", so the game's own flow carries on as normal.
+	--
+	-- The prompt can't always be recognised when its slide-in tween is
+	-- created (its text may not be set yet), so from the moment the body
+	-- prompt is answered until the materials prompt is recognised, tweens on
+	-- anything other than the body prompt are made instant too.
 	local handled = setmetatable({}, {__mode = "k"})
-	local tweenTargets = setmetatable({}, {__mode = "k"})
+	local bodyFrame, armedAt
 
-	local function inHandledFrame(obj)
-		for frame in pairs(handled) do
-			if obj == frame or obj:IsDescendantOf(frame) then return true end
-		end
-		return false
+	local function inside(obj, frame)
+		return frame ~= nil and (obj == frame or obj:IsDescendantOf(frame))
 	end
 
-	-- Tweens on the hidden prompt finish instantly, and tween delays are
-	-- dropped while rushing.
-	local function adjustTweenInfo(obj, tweenInfo)
-		if typeof(obj) ~= "Instance" or typeof(tweenInfo) ~= "TweenInfo" then return tweenInfo end
-		local materials = obj:IsA("GuiObject") and (inHandledFrame(obj) or isMaterialsFrame(obj))
-		if (materials and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0))
-		   or (rush.active and tweenInfo.DelayTime > 0) then
-			if rush.active then
-				rush.skipped = rush.skipped + (materials and tweenInfo.Time or 0) + tweenInfo.DelayTime
-			end
-			return TweenInfo.new(
-				materials and 0 or tweenInfo.Time,
-				tweenInfo.EasingStyle,
-				tweenInfo.EasingDirection,
-				tweenInfo.RepeatCount,
-				tweenInfo.Reverses,
-				0
-			)
+	local function isHiddenPromptTween(obj)
+		if typeof(obj) ~= "Instance" or not obj:IsA("GuiObject") then return false end
+		for frame in pairs(handled) do
+			if inside(obj, frame) then return true end
 		end
-		return tweenInfo
+		if armedAt and os.clock() - armedAt < 2 and not inside(obj, bodyFrame) then
+			return true
+		end
+		return isMaterialsFrame(obj)
 	end
 
 	local function createTween(create, self, obj, tweenInfo, goal)
-		local ok, newInfo = pcall(adjustTweenInfo, obj, tweenInfo)
-		local tween = create(self, obj, ok and newInfo or tweenInfo, goal)
-		if typeof(obj) == "Instance" and typeof(tween) == "Instance" then
-			tweenTargets[tween] = obj
+		if typeof(tweenInfo) == "TweenInfo" and (tweenInfo.Time > 0 or tweenInfo.DelayTime > 0) then
+			local ok, hidden = pcall(isHiddenPromptTween, obj)
+			if ok and hidden then
+				tweenInfo = TweenInfo.new(
+					0,
+					tweenInfo.EasingStyle,
+					tweenInfo.EasingDirection,
+					tweenInfo.RepeatCount,
+					tweenInfo.Reverses,
+					0
+				)
+			end
 		end
-		return tween
+		return create(self, obj, tweenInfo, goal)
 	end
 
-	-- Each hook is installed on its own so one failure doesn't take the rest
-	-- down with it. hookfunction returns the original; calling the hooked
-	-- function from inside its wrapper would recurse into the wrapper.
-	local function hook(name, target, makeWrapper)
-		local ok, err = pcall(function()
-			local original
-			local wrapper = makeWrapper(function(...) return original(...) end)
-			if newcclosure then wrapper = newcclosure(wrapper) end
-			original = hookfunction(target, wrapper)
-		end)
-		log(name .. (ok and " hooked" or (" hook FAILED: " .. tostring(err))))
-	end
-
+	-- hookfunction returns the original; calling the hooked function from
+	-- inside its wrapper would recurse into the wrapper.
 	if hookfunction then
-		hook("TweenService.Create", TweenService.Create, function(orig)
-			return function(self, obj, tweenInfo, goal)
-				return createTween(orig, self, obj, tweenInfo, goal)
+		local ok, err = pcall(function()
+			local oldCreate
+			local createWrapper = function(self, obj, tweenInfo, goal)
+				return createTween(oldCreate, self, obj, tweenInfo, goal)
 			end
+			if newcclosure then createWrapper = newcclosure(createWrapper) end
+			oldCreate = hookfunction(TweenService.Create, createWrapper)
 		end)
-
-		-- A rushed wait still yields one frame so loops can't spin forever.
-		local function rushedWait(orig)
-			return function(t)
-				if rush.active then
-					rush.skipped = rush.skipped + (tonumber(t) or 0)
-					return orig()
-				end
-				return orig(t)
-			end
-		end
-		hook("task.wait", task.wait, rushedWait)
-		hook("wait", (getrenv and getrenv().wait) or wait, rushedWait)
-
-		hook("task.delay", task.delay, function(orig)
-			return function(t, ...)
-				if rush.active then
-					rush.skipped = rush.skipped + (tonumber(t) or 0)
-					return orig(0, ...)
-				end
-				return orig(t, ...)
-			end
-		end)
-	else
-		log("hookfunction unavailable")
+		log("TweenService.Create" .. (ok and " hooked" or (" hook FAILED: " .. tostring(err))))
 	end
 
 	-- The game calls TweenService:Create(...), which goes through __namecall
-	-- and skips the hookfunction hook above on many executors. That's why the
-	-- hidden prompt kept its full slide-in and the forcefield prompt waited
-	-- for it.
+	-- and skips the hookfunction hook above on many executors.
 	if hookmetamethod and getnamecallmethod then
 		local ok, err = pcall(function()
 			local oldNamecall
 			local namecallWrapper = function(self, ...)
 				if self == TweenService and getnamecallmethod() == "Create" then
-					-- Index call, not a namecall: anything namecalled while adjusting
+					-- Index call, not a namecall: anything namecalled while checking
 					-- changes the pending method name, so oldNamecall can't be reused.
 					return createTween(TweenService.Create, self, ...)
 				end
@@ -273,48 +163,37 @@ task.spawn(function()
 			oldNamecall = hookmetamethod(game, "__namecall", namecallWrapper)
 		end)
 		log("__namecall" .. (ok and " hooked" or (" hook FAILED: " .. tostring(err))))
-	else
-		log("hookmetamethod unavailable")
 	end
 
-	-- Tweens started on the prompt before it was recognised: cancel them so
-	-- anything waiting on Completed carries on now, and stop any that get
-	-- played later.
-	local function finishTweens(frame)
-		for tween, target in pairs(tweenTargets) do
-			if target == frame or target:IsDescendantOf(frame) then
-				pcall(function() tween:Cancel() end)
-				tween:GetPropertyChangedSignal("PlaybackState"):Connect(function()
-					if tween.PlaybackState == Enum.PlaybackState.Playing then
-						tween:Cancel()
-					end
-				end)
-			end
-		end
-	end
+	local watchedBody = setmetatable({}, {__mode = "k"})
 
-	local function questionOf(frame)
+	local function watchBody(frame)
+		if watchedBody[frame] or not frame:IsA("Frame") or not isBodyFrame(frame) then return end
+		local buttons = {}
 		for _, d in ipairs(frame:GetDescendants()) do
-			if d:IsA("TextLabel") and d.Text ~= "" then
-				return d.Text:sub(1, 28)
-			end
+			if d:IsA("TextButton") then table.insert(buttons, d) end
 		end
-		return "?"
+		if #buttons == 0 then return end
+		watchedBody[frame] = true
+		for _, btn in ipairs(buttons) do
+			btn.MouseButton1Click:Connect(function()
+				bodyFrame = frame
+				armedAt = os.clock()
+				log("body prompt answered")
+			end)
+		end
 	end
 
 	local function skipFrame(frame)
 		if handled[frame] or not frame:IsA("Frame") or not isMaterialsFrame(frame) then return end
 		handled[frame] = true
-		log("materials prompt detected")
+		armedAt = nil
+		log("materials prompt hidden")
 
 		pcall(function()
 			frame.Visible = false
-			-- Overriding with a 0s legacy tween also ends any TweenPosition the
-			-- game started on it.
-			frame:TweenPosition(UDim2.new(0, 0, 0, -9999), Enum.EasingDirection.Out,
-				Enum.EasingStyle.Linear, 0, true)
+			frame.Position = UDim2.new(0, 0, 0, -9999)
 		end)
-		finishTweens(frame)
 
 		local noBtn
 		for _, d in ipairs(frame:GetDescendants()) do
@@ -329,73 +208,40 @@ task.spawn(function()
 			return
 		end
 
-		local handler = getClickHandler(noBtn)
-		local showFF, onMats = findGameFns(handler)
+		-- Let the game's own No handler run, so it records the answer and
+		-- shows the forcefield prompt itself.
+		fireClick(noBtn)
+	end
 
-		if type(showFF) == "function" then
-			-- Show the forcefield prompt straight away instead of letting the
-			-- game wait out the hidden prompt's slide-out first.
-			log("fast path" .. (onMats and "" or " (OnMaterialsSelected not found)"))
-			startRush()
-			task.spawn(showFF)
-			if type(onMats) == "function" then task.spawn(pcall, onMats, false) end
-			playClick()
-			pcall(function() frame:Destroy() end)
-		else
-			log("fallback: firing No (handler " .. (handler and "found" or "missing") .. ")")
-			startRush()
-			fireClick(noBtn)
-			log("No fired")
-		end
+	local function check(frame)
+		skipFrame(frame)
+		watchBody(frame)
 	end
 
 	-- React the moment the frame (or its question text) shows up instead of
 	-- waiting for the next render step.
 	sg.ChildAdded:Connect(function(child)
-		skipFrame(child)
-		if not child:IsA("Frame") then return end
-		task.defer(function()
-			if not handled[child] then log("prompt added: " .. questionOf(child)) end
-		end)
-		if rush.active and not handled[child] and not rush.endAt then
-			-- The next prompt arrived; let its slide-in tween get created, then stop.
-			rush.endAt = os.clock() + 0.15
-			log(string.format("next prompt %.2fs after skip", os.clock() - rush.startedAt))
-		end
-		if handled[child] then return end
+		check(child)
+		if handled[child] or not child:IsA("Frame") then return end
 		local conn
 		conn = child.DescendantAdded:Connect(function(d)
 			if d:IsA("TextLabel") then
-				task.defer(skipFrame, child)
+				task.defer(check, child)
 				d:GetPropertyChangedSignal("Text"):Connect(function()
-					skipFrame(child)
+					check(child)
 				end)
 			end
 			if handled[child] then conn:Disconnect() end
 		end)
 	end)
 
-	sg.ChildRemoved:Connect(function(child)
-		if child:IsA("Frame") and not handled[child] then
-			log("prompt removed")
-		end
-	end)
-
 	RunService.RenderStepped:Connect(function()
-		if rush.active then
-			local now = os.clock()
-			if (rush.endAt and now >= rush.endAt) or now - rush.startedAt > 2 then
-				rush.active = false
-				log(string.format("rush over, skipped %.2fs of waits", rush.skipped))
-			end
-		end
-
 		if not sg or not sg.Parent then return end
 
 		for _, frame in ipairs(sg:GetChildren()) do
-			skipFrame(frame)
+			check(frame)
 		end
 	end)
 
-	log("v5 watching")
+	log("v6 watching")
 end)
